@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	prometheusURL    = "http://whizard-agent-proxy.kubesphere-monitoring-system.svc.cluster.local/api/v1/query"
+	prometheusURL = "http://whizard-agent-proxy.kubesphere-monitoring-system.svc.cluster.local:9090/api/v1/query"
+	//prometheusURL    = "http://172.31.18.9:31322/api/v1/query"
 	cpuUsageQuery    = `avg by (node, cluster) (irate(node_cpu_used_seconds_total{job="kubeedge"}[5m])) * 100`
 	memoryUsageQuery = `node:node_memory_utilisation:{data_source="edge"} * 100`
-	TaintName        = "edge-node-overload.edgewize.io"
+	TaintName        = "overload.edgewize.io/edge"
+	LabelName        = "overload.edgewize.io/edge"
 )
 
 var (
@@ -54,7 +56,10 @@ func main() {
 	flag.Float64Var(&MemoryThreshold, "memoryThreshold", 90.0, "Memory threshold to calculate Memory")
 	flag.IntVar(&Interval, "interval", 60, "Interval in seconds")
 
-	taintedNodeCache := make(map[string]struct{})
+	flag.Parse()
+
+	var taintedNodeCache map[string]struct{}
+	log.Printf("当前设置 CPU 使用率阈值 [%f], MEM 使用率阈值 [%f]", CpuThreshold, MemoryThreshold)
 
 	// 创建Kubernetes客户端
 	config, err := rest.InClusterConfig()
@@ -70,6 +75,12 @@ func main() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		taintedNodeCache, err = getTaintedNodes(clientset)
+		if err != nil {
+			log.Printf("获取已经设置污点的节点失败, %v", err)
+			continue
+		}
+
 		// 获取超过阈值的节点
 		nodesOverThreshold, err := getNodesUsage()
 		if err != nil {
@@ -77,17 +88,27 @@ func main() {
 			continue
 		}
 
+		nodeToRemove := []string{}
 		if len(nodesOverThreshold) == 0 {
 			log.Printf("未发现超出阈值节点")
-			continue
+		} else {
+			//fmt.Printf("以下节点的 CPU 或 MEM 使用率超过 CPU 阈值 [%f] 或 MEM 阈值 [%f]: \n", CpuThreshold, MemoryThreshold)
+			for nodeName, usage := range nodesOverThreshold {
+				if _, ok := taintedNodeCache[nodeName]; ok {
+					continue
+				}
+
+				if usage.CPU > 0.0 {
+					fmt.Printf("节点 [%s]: CPU 使用率 [%f] 超过阈值 \n", nodeName, usage.CPU)
+				}
+
+				if usage.Memory > 0.0 {
+					fmt.Printf("节点 [%s]: MEM 使用率 [%f] 超过阈值 \n", nodeName, usage.Memory)
+				}
+			}
+
 		}
 
-		fmt.Printf("以下节点的 CPU 或 MEM 使用率超过 CPU 阈值 [%f] 或 MEM 阈值 [%f]: \n", CpuThreshold, MemoryThreshold)
-		for nodeName, usage := range nodesOverThreshold {
-			fmt.Printf("节点 %s: CPU 使用率 [%f] , MEM 使用率 [%f]\n", nodeName, usage.CPU, usage.Memory)
-		}
-
-		nodeToRemove := make([]string, len(taintedNodeCache))
 		for nodeName := range taintedNodeCache {
 			_, exists := nodesOverThreshold[nodeName]
 			if !exists {
@@ -96,25 +117,14 @@ func main() {
 		}
 
 		//// 处理每个节点的污点
-		for nodeName, usage := range nodesOverThreshold {
+		for nodeName, _ := range nodesOverThreshold {
 			taintedNodeCache[nodeName] = struct{}{}
-			fmt.Printf("节点 %s: CPU 使用率 [%f] , MEM 使用率 [%f]\n", nodeName, usage.CPU, usage.Memory)
-			err := taintNode(clientset, nodeName)
-			if err != nil {
-				log.Printf("Error tainting node %s: %v", nodeName, err)
-			} else {
-				log.Printf("Successfully tainted node %s", nodeName)
-			}
+			taintNode(clientset, nodeName)
 		}
 
 		// 将没有超出阈值的节点上的污点移除
-		for nodeName := range taintedNodeCache {
-			err := removeTaintNode(clientset, nodeName)
-			if err != nil {
-				log.Printf("移除污点失败 节点 %s: %v", nodeName, err)
-			} else {
-				log.Printf("移除污点成功 节点 %s", nodeName)
-			}
+		for _, nodeName := range nodeToRemove {
+			removeTaintNode(clientset, nodeName)
 		}
 	}
 }
@@ -205,17 +215,34 @@ func normalizeNodeName(instance string) string {
 	return instance
 }
 
-func taintNode(clientset *kubernetes.Clientset, nodeName string) error {
+func getTaintedNodes(clientset *kubernetes.Clientset) (taintedNodeCache map[string]struct{}, err error) {
+	nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=", LabelName),
+	})
+	if err != nil {
+		return
+	}
+
+	taintedNodeCache = make(map[string]struct{}, len(nodes.Items))
+	for _, node := range nodes.Items {
+		taintedNodeCache[node.Name] = struct{}{}
+	}
+
+	return
+}
+
+func taintNode(clientset *kubernetes.Clientset, nodeName string) {
 	// 获取节点对象
 	node, err := clientset.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		return err
+		log.Printf("添加污点失败 节点 %s: %v", nodeName, err)
+		return
 	}
 
 	// 创建新的污点
 	newTaint := v1.Taint{
 		Key:    TaintName,
-		Value:  time.Now().Format("2006-01-02T15:04:05"),
+		Value:  "",
 		Effect: v1.TaintEffectNoSchedule,
 	}
 
@@ -229,22 +256,35 @@ func taintNode(clientset *kubernetes.Clientset, nodeName string) error {
 	}
 
 	if !taintExists {
+		fmt.Printf("准备为节点 %s 添加污点\n", nodeName)
 		node.Spec.Taints = append(node.Spec.Taints, newTaint)
+
+		nodeLabels := node.Labels
+		if nodeLabels == nil {
+			nodeLabels = map[string]string{}
+		}
+
+		node.Labels[LabelName] = ""
 		_, err = clientset.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
-		return err
+		if err != nil {
+			log.Printf("添加污点失败 节点 %s: %v", nodeName, err)
+		} else {
+			log.Printf("添加污点成功 节点 %s", nodeName)
+		}
 	}
 
-	return nil
+	return
 }
 
-func removeTaintNode(clientset *kubernetes.Clientset, nodeName string) error {
+func removeTaintNode(clientset *kubernetes.Clientset, nodeName string) {
 	// 获取节点对象
 	node, err := clientset.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		return err
+		log.Printf("移除污点失败 节点 %s: %v", nodeName, err)
+		return
 	}
 
-	newTaints := make([]v1.Taint, len(node.Spec.Taints))
+	newTaints := []v1.Taint{}
 	// 检查是否已存在相同key的污点
 	taintExists := false
 	for _, t := range node.Spec.Taints {
@@ -259,9 +299,17 @@ func removeTaintNode(clientset *kubernetes.Clientset, nodeName string) error {
 	if taintExists {
 		log.Printf("移除节点 [%s] 上污点 [%s]", nodeName, TaintName)
 		node.Spec.Taints = newTaints
+		if len(node.Labels) != 0 {
+			delete(node.Labels, LabelName)
+		}
+
 		_, err = clientset.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
-		return err
+		if err != nil {
+			log.Printf("移除污点失败 节点 %s: %v", nodeName, err)
+		} else {
+			log.Printf("移除污点成功 节点 %s", nodeName)
+		}
 	}
 
-	return nil
+	return
 }

@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: node-watcher-deployment
 spec:
-  replicas: 1  # 副本数量
+  replicas: 1
   selector:
     matchLabels:
       app: node-watcher
@@ -12,9 +12,10 @@ spec:
       labels:
         app: node-watcher
     spec:
-      serviceAccountName: kubesphere-cluster-admin  # 指定使用的Service Account
+      serviceAccountName: kubesphere-cluster-admin
       containers:
         - name: node-watcher
           image: harbor.dev.thingsdao.com/edgewize/node-watcher:v0.0.1
           command:
             - /root/nodeWatcher
+            - --memoryThreshold=40.0
