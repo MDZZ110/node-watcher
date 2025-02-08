@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-watcher-deployment
+spec:
+  replicas: 1  # 副本数量
+  selector:
+    matchLabels:
+      app: node-watcher
+  template:
+    metadata:
+      labels:
+        app: node-watcher
+    spec:
+      serviceAccountName: kubesphere-cluster-admin  # 指定使用的Service Account
+      containers:
+        - name: node-watcher
+          image: harbor.dev.thingsdao.com/edgewize/node-watcher:v0.0.1
+          command:
+            - /root/nodeWatcher
